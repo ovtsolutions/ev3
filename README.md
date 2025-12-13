@@ -57,6 +57,10 @@ backend_ip=10.0.10.21
 # storage API port
 backend_port=7000
 
+# unique replication internal secret sharted between replicated hosts and used in web requests 
+# use your unique value...
+replication_internal_secret = 4abcfe3b-367f-477d-89bd-283c4382e5f6
+
 # available modes
 # async : write completion is determined when data
 # semi-sync: write completion is determined when data is written to the local disk and the local TOP transmission buffer

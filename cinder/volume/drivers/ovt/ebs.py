@@ -60,6 +60,8 @@ replication_opts = [
     cfg.StrOpt('replication_mode',
                default='full-sync',
                help='Replication protocols that define how data is synchronized between primary and secondary hosts'),
+    cfg.StrOpt('replication_internal_secret',
+               help='Unique replication internal secret sharted between replicated hosts and used in web requests'),
     cfg.IntOpt('replication_starting_port',
                default=7001,
                help='Initial starting port to connect replicated volumes.'),
@@ -78,7 +80,7 @@ class EBSAPIException(exception.VolumeBackendAPIException):
 class EBSAPIRetryableException(exception.VolumeBackendAPIException):
     message = _("Retryable EBS API Exception encountered")
 
-retry_web_tuple = (EBSAPIRetryableException,)
+retry_tuple = (EBSAPIRetryableException,)
 
 @interface.volumedriver
 class EBSVolumeDriver(LVMVolumeDriver):
@@ -131,8 +133,11 @@ class EBSVolumeDriver(LVMVolumeDriver):
                                        "error message was: %s")
                                      % six.text_type(exc.stderr))
                 raise exception.VolumeBackendAPIException(data=exception_message)
-        self.listen()
 
+        if self.configuration.replication_internal_secret is None:
+            LOG.warning("The replication_internal_secret value is not specified. Failed to initialize EBS driver correctly.")
+
+        self.listen()
 
     def create_volume(self, volume):
         super().create_volume(volume)
@@ -498,7 +503,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
             LOG.error(f"Failed to initialize replicated volume {resource_id}, an unexpected error occurred: {e}")
 
 
-    # TODO to be refactored  
+    @utils.retry(retry_tuple, interval=2, retries=5)
     def __skipping_initial_resynchronization(self, resource):
         """
         Skips initial sync between drbd devices
@@ -506,20 +511,15 @@ class EBSVolumeDriver(LVMVolumeDriver):
         :return: None
         """
         res_id = resource.get('volume_id')
-        # time.sleep(5)
-        eventlet.sleep(5)
         try:
             root_helper = utils.get_root_helper()
             self._execute('drbdadm', '--clear-bitmap', 'new-current-uuid', res_id, root_helper=root_helper,
                           run_as_root=True)
         except processutils.ProcessExecutionError as e:
-            exception_message = (
-                    _(f"Failed to skip initial resynchronization for volume id {res_id}, error message was: %s")
-                    % six.text_type(e.stderr)
-            )
-            LOG.error(exception_message)
+            raise EBSAPIRetryableException(data=str(e))
         except Exception as e:
             LOG.error(f"Failed to skip initial resynchronization for volume id {res_id}, an error occurred: {e}")
+            raise EBSAPIRetryableException(data=str(e))
 
 
     def __setup_drbd_config(self, resource):
@@ -540,8 +540,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
         config = RESOURCE_CONF.format(resource_id=res_id, protocol=protocol, backends=backends, minor=minor).lstrip()
 
         try:
-            with open(f"/etc/drbd.d/{res_id}.res", "w") as file:
-                file.write(config)
+            self.__write_drbd_config(res_id, config)
             root_helper = utils.get_root_helper()
             LOG.info(f"Created replicated resource {res_id}, device minor is {minor}")
             self._execute('drbdadm', 'create-md', res_id, root_helper=root_helper, run_as_root=True)
@@ -559,6 +558,28 @@ class EBSVolumeDriver(LVMVolumeDriver):
             LOG.error(exception_message)
         except Exception as e:
             LOG.error(f"Failed to initialize replicated volume {res_id}, an unexpected error occurred: {e}")
+
+
+    @staticmethod
+    def __write_drbd_config(res_id, config_content):
+        """
+        Safely saves config
+        :param res_id:
+        :param config_content:
+        :return:
+        """
+        config_path = f"/etc/drbd.d/{res_id}.res"
+        tmp_path = config_path + ".tmp"
+
+        # Writing to a temporary file and atomic transfer
+        try:
+            with open(tmp_path, "w") as f:
+                f.write(config_content)
+            os.rename(tmp_path, config_path)
+        except Exception as e:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise e
 
 
     def __remove_drbd_config(self, resource):
@@ -709,9 +730,8 @@ class EBSVolumeDriver(LVMVolumeDriver):
                 'X-OVT-Resource-ID': resource_id}
 
 
-    @staticmethod
-    @utils.retry(retry_web_tuple, interval=1, retries=3)
-    def _do_client_request(api_method, endpoint, data=None):
+    @utils.retry(retry_tuple, interval=1, retries=3)
+    def _do_client_request(self, api_method, endpoint, data=None):
         """
         Makes the http request to EBS storage backend
         :param api_method: the http request method
@@ -719,15 +739,11 @@ class EBSVolumeDriver(LVMVolumeDriver):
         :param data: the data posted to backend in json format
         :return: the response from storage backend in json format, raise EBSAPIException if response state code != 200
         """
-        content_length = 0
         if data is None:
             data = {}
-        # else:
-        #     content_length = len(str(data))
-
-        # headers = {'Content-Type': 'application/json', 'Content-Length': str(content_length)}
+        headers = {'X-Auth-Token': self.configuration.replication_internal_secret}
         try:
-            with requests.post(url=f"{endpoint}{api_method}", json=data) as resp:
+            with requests.post(url=f"{endpoint}{api_method}", headers=headers, json=data) as resp:
                 if resp.status_code == 200:
                     return resp.json()
                 else:
