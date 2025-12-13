@@ -15,15 +15,18 @@
 #    under the License.
 
 """
-Driver for servers running replicated elastic block storage.
+Driver for servers running replicated EBS.
 """
+
 import os
+import threading
 
 import six
 import time
 import json
 import fnmatch
 import requests
+import eventlet
 
 from oslo_concurrency import processutils
 from oslo_config import cfg
@@ -34,6 +37,7 @@ from cinder.i18n import _
 from cinder import interface
 from cinder import utils
 from cinder import exception
+from cinder import coordination
 from cinder.objects import fields
 from cinder.volume.drivers.lvm import LVMVolumeDriver
 from webob import Request, Response
@@ -142,12 +146,12 @@ class EBSVolumeDriver(LVMVolumeDriver):
 
     def extend_volume(self, volume, new_size):
         super().extend_volume(volume, new_size)
-        self.__set_replicated_device_primary(resource_id=volume.id, force=True)
+        self.__set_drbd_resource_primary(resource_id=volume.id, force=True)
         if self.extend_replicated_volume(volume, new_size):
             LOG.info(f"Remote replica of volume {volume.id} has been successfully extended up to {new_size}G")
         else:
             LOG.warning(f"Remote replica of volume {volume.id} didn't extended up to {new_size}G")
-        self.__resize_replicated_device(volume.id, new_size)
+        self.__resize_drbd_resource(volume.id, new_size)
 
 
     def create_snapshot(self, snapshot):
@@ -279,7 +283,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
         """
         Extracts and returns ip and port for secondary backend
         :param secondary_backend:
-        :return: the secondary backend endpoint
+        :return:
         """
         backend_ip = secondary_backend['ip']
         backend_port = secondary_backend['port']
@@ -312,7 +316,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
                 repl_status = fields.ReplicationStatus.ERROR
 
         self.__save_resource_meta(resource)
-        self.__setup_replicated_device(resource)
+        self.__setup_drbd_config(resource)
         self.__skipping_initial_resynchronization(resource)
 
         model_update = {
@@ -374,7 +378,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
                 LOG.error(f"The resource for {volume['name']} on backend {secondary_backend_id} was not deleted, "
                           f"an EBSAPIRetryableException  occurred: {a.message}")
         self.__delete_resource_meta(resource)
-        self.__remove_replicated_device(resource)
+        self.__remove_drbd_config(resource)
 
 
     def __save_resource_meta(self, resource):
@@ -415,7 +419,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
         :param volume: cinder volume
         :return: resource object as dict
         """
-        minor = self.__allocate_device_minors()
+        minor = self.__allocate_drdb_minors()
 
         backends = list()
         backends.append({
@@ -448,8 +452,8 @@ class EBSVolumeDriver(LVMVolumeDriver):
         DRDB resource management
     """
     # TODO check refactoring
-    @staticmethod
-    def __allocate_device_minors():
+    @coordination.synchronized('allocate_drdb_minors')
+    def __allocate_drdb_minors(self):
         """
         Allocates drdb minor numbers
         :return: number
@@ -470,7 +474,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
         return minor_number
 
 
-    def __set_replicated_device_primary(self, resource_id, force=False):
+    def __set_drbd_resource_primary(self, resource_id, force=False):
         """
         Sets the local drbd device primary
         :param resource_id: drbd resource id
@@ -494,6 +498,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
             LOG.error(f"Failed to initialize replicated volume {resource_id}, an unexpected error occurred: {e}")
 
 
+    # TODO to be refactored  
     def __skipping_initial_resynchronization(self, resource):
         """
         Skips initial sync between drbd devices
@@ -501,7 +506,8 @@ class EBSVolumeDriver(LVMVolumeDriver):
         :return: None
         """
         res_id = resource.get('volume_id')
-        time.sleep(5)
+        # time.sleep(5)
+        eventlet.sleep(5)
         try:
             root_helper = utils.get_root_helper()
             self._execute('drbdadm', '--clear-bitmap', 'new-current-uuid', res_id, root_helper=root_helper,
@@ -516,7 +522,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
             LOG.error(f"Failed to skip initial resynchronization for volume id {res_id}, an error occurred: {e}")
 
 
-    def __setup_replicated_device(self, resource):
+    def __setup_drbd_config(self, resource):
         """
         Setups drbd device for replication
         :param resource: resource object as dict
@@ -542,14 +548,6 @@ class EBSVolumeDriver(LVMVolumeDriver):
             self._execute('drbdadm', 'up', res_id, root_helper=root_helper, run_as_root=True)
 
             LOG.info(f"Replicated resource {res_id} was successfully started.")
-            if not os.path.exists(f"/dev/drbd/by-res/{res_id}/0"):
-                try:
-                    os.makedirs(f"/dev/drbd/by-res/{res_id}")
-                    os.symlink(f"/dev/drbd/{minor}", f"/dev/drbd/by-res/{res_id}/0")
-                except FileExistsError:
-                    LOG.info(f"The directory /dev/drbd/by-res/{res_id}/0 already exist.")
-                except OSError as e:
-                    LOG.error(f"Error creating /dev/drbd/by-res/{res_id}/0: {e}")
 
         except IOError as e:
             LOG.error(f"An I/O error occurred while writing the file /etc/drbd.d/{res_id}.res: {e}")
@@ -563,7 +561,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
             LOG.error(f"Failed to initialize replicated volume {res_id}, an unexpected error occurred: {e}")
 
 
-    def __remove_replicated_device(self, resource):
+    def __remove_drbd_config(self, resource):
         """
         Stops drbd replication and removes drbd configuration
         :param resource: resource object as a dict
@@ -593,7 +591,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
         return False
 
 
-    def __resize_replicated_device(self, resource_id, new_size):
+    def __resize_drbd_resource(self, resource_id, new_size):
         """
         Invokes resizing of drbd resource
         :param resource_id: drbd resource uuid
@@ -628,7 +626,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
         :return: dict of model update
         """
         LOG.info(str(volume))
-        self.__set_replicated_device_primary(volume['id'])
+        self.__set_drbd_resource_primary(volume['id'])
 
         volume_path = self.local_path(volume)
         self.vg.activate_lv(volume['name'])
@@ -647,7 +645,7 @@ class EBSVolumeDriver(LVMVolumeDriver):
         :param vg: lvm volume group
         :return: property set of provider location and authorization
         """
-        self.__set_replicated_device_primary(volume['id'])
+        self.__set_drbd_resource_primary(volume['id'])
 
         if vg is None:
             vg = self.configuration.volume_group
@@ -724,14 +722,12 @@ class EBSVolumeDriver(LVMVolumeDriver):
         content_length = 0
         if data is None:
             data = {}
-        else:
-            content_length = len(str(data))
+        # else:
+        #     content_length = len(str(data))
 
-        headers = {'Content-Type': 'application/json', 'Content-Length': str(content_length)}
-
+        # headers = {'Content-Type': 'application/json', 'Content-Length': str(content_length)}
         try:
-            with requests.post(url=f"{endpoint}{api_method}",
-                               headers=headers, json=data) as resp:
+            with requests.post(url=f"{endpoint}{api_method}", json=data) as resp:
                 if resp.status_code == 200:
                     return resp.json()
                 else:
@@ -753,17 +749,17 @@ class EBSVolumeDriver(LVMVolumeDriver):
                 resp.status_code = 200
                 resp.text = 'alive'
             elif req.method == 'POST' and req.path == '/create_volume':
-                volume = req.json
-                self.__save_resource_meta(volume)
-                super()._create_volume(volume['volume_name'],
-                                       self._sizestr(volume['volume_size']),
+                resource = req.json
+                self.__save_resource_meta(resource)
+                super()._create_volume(resource['volume_name'],
+                                       self._sizestr(resource['volume_size']),
                                        self.configuration.lvm_type,
                                        0)
 
-                self.__setup_replicated_device(volume)
+                self.__setup_drbd_config(resource)
                 resp.status_code = 200
                 resp.json = {}
-                LOG.info(f"The volume replica {volume['volume_id']} was successfully created")
+                LOG.info(f"The volume replica {resource['volume_id']} was successfully created")
             elif req.method == 'POST' and req.path == '/create_snapshot':
                 snapshot = req.json
                 self.vg.create_lv_snapshot(self._escape_snapshot(snapshot['name']),
@@ -773,17 +769,17 @@ class EBSVolumeDriver(LVMVolumeDriver):
                 resp.json = {}
                 LOG.info(f"The volume snapshot replica {snapshot['name']} was successfully created")
             elif req.method == 'POST' and req.path == '/delete_volume':
-                volume = req.json
-                self.__remove_replicated_device(volume)
-                self.__delete_resource_meta(volume)
+                resource = req.json
+                self.__remove_drbd_config(resource)
+                self.__delete_resource_meta(resource)
                 volume = {
-                    'id': volume['volume_id'],
-                    'name': volume['volume_name']
+                    'id': resource['volume_id'],
+                    'name': resource['volume_name']
                 }
                 super()._delete_volume(volume)
                 resp.status_code = 200
                 resp.json = {}
-                LOG.info(f"The volume replica {volume['volume_id']} was successfully deleted")
+                LOG.info(f"The volume replica {resource['volume_id']} was successfully deleted")
             elif req.method == 'POST' and req.path == '/delete_snapshot':
                 snapshot = req.json
                 message = f"The volume snapshot replica {snapshot['name']} was successfully deleted"
@@ -799,12 +795,12 @@ class EBSVolumeDriver(LVMVolumeDriver):
                 }
                 LOG.info(message)
             elif req.method == 'POST' and req.path == '/extend_volume':
-                volume = req.json
-                new_size = self._sizestr(volume['volume_size'])
-                self.vg.extend_volume(volume['volume_name'], self._sizestr(new_size))
+                resource = req.json
+                new_size = self._sizestr(resource['volume_size'])
+                self.vg.extend_volume(resource['volume_name'], self._sizestr(new_size))
                 resp.status_code = 200
                 resp.json = {}
-                message = f"The volume {volume['volume_id']} has been successfully extended up to {volume['volume_size']}G"
+                message = f"The volume {resource['volume_id']} has been successfully extended up to {resource['volume_size']}G"
                 LOG.info(message)
             else:
                 resp.status_code = 404
