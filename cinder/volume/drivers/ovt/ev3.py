@@ -25,6 +25,7 @@ import six
 import json
 import fnmatch
 import requests
+import datetime
 
 from oslo_concurrency import processutils
 from oslo_config import cfg
@@ -91,7 +92,7 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
     def __init__(self, *args, **kwargs):
         # Parent sets db, host, _execute and base config
         # replication_status: disabled
-        self.SUPPORTS_ACTIVE_ACTIVE = True
+        # self.SUPPORTS_ACTIVE_ACTIVE = True
         super(ReplicatedVolumeDriver, self).__init__(*args, **kwargs)
         self.configuration.append_config_values(replication_opts)
 
@@ -257,27 +258,44 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
         :param groups: the cinder volume group
         :return:
         """
-        backend_id = secondary_id
 
         model_updates = []
-        replication_status = fields.ReplicationStatus.ENABLED
+        if secondary_id is None:
+            return secondary_id, model_updates, []
 
-        if backend_id == 'default':
-            backend_id = self.configuration.backend_id
-            replication_status = fields.ReplicationStatus.FAILED_OVER
+        active_backend_id = secondary_id
 
-        for volume in volumes:
-            if secondary_id != 'default':
-                host =  backend_id + '#' + volume['volume_type']['name']
+        if secondary_id == 'default':
+            active_backend_id = self.configuration.backend_id
+
+            host = self.configuration.backend_id + '#' + self.configuration.volume_backend_name
+
+            volume_update = {
+                'host': host,
+                'provider_id': active_backend_id,
+                'replication_status': fields.ReplicationStatus.FAILED_OVER,
+                'updated_at': datetime.datetime.now(),
+            }
+
+            for f in os.listdir(f"{CONF.get('state_path')}/{RESOURCE_META}/"):
+                model_updates.append({
+                    'volume_id': f,
+                    'updates': volume_update,
+                })
+                self.db.volume_update(context,f,volume_update)
+        else:
+            for volume in volumes:
+                host =  secondary_id + '#' + self.configuration.volume_backend_name
                 model_updates.append({
                     'volume_id': volume['id'],
                     'updates': {
                         'host': host,
-                        'provider_id': backend_id,
-                        'replication_status': replication_status,
+                        'provider_id': active_backend_id,
+                        'replication_status': fields.ReplicationStatus.ENABLED,
                     }
                 })
-        return secondary_id, model_updates, []
+
+        return active_backend_id, model_updates, []
 
 
     @staticmethod

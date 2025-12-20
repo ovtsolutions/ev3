@@ -185,8 +185,6 @@ openstack volume service list --long
 cinder failover-host hci-0002@RBS --backend_id default
 cinder freeze-host hci-0002@RBS
 
-cinder-manage volume update_host --currenthost hci-0001@RBS#ev3 --newhost hci-0002@RBS#ev3
-
 openstack volume service list --long
 +------------------+--------------+------+----------+-------+----------------------------+---------------------------------------------------------------+
 | Binary           | Host         | Zone | Status   | State | Updated At                 | Disabled Reason                                               |
