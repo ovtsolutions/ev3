@@ -797,7 +797,7 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
         hmac_digest = hmac.new(secret_key, ev3_date.encode('utf-8'), hashlib.sha256)
         if token != hmac_digest.hexdigest():
             resp.status_code = 403
-            resp(environ, start_response)
+            return resp(environ, start_response)
         # end block: token check
 
         try:
