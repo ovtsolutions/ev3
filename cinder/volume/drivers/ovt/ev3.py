@@ -30,6 +30,7 @@ import hmac
 import hashlib
 
 from oslo_concurrency import processutils
+from oslo_concurrency import lockutils
 from oslo_config import cfg
 from oslo_log import log as logging
 from threading import Thread
@@ -44,8 +45,10 @@ from cinder.volume.drivers.lvm import LVMVolumeDriver
 from webob import Request, Response
 from wsgiref.simple_server import make_server
 
-
-import cinder.volume.drivers.ovt.resources as ev3_res
+# import cinder.volume.drivers.ovt.
+from cinder.volume.drivers.ovt.resources import REPLICATION_PROTOCOLS, RESOURCE_CONF, BACKEND
+from cinder.volume.drivers.ovt.resources import HTTP_HEADER_X_EV3_DATE, HTTP_HEADER_X_EV3_TOKEN
+from cinder.volume.drivers.ovt.signature import AbstractSignerForAuthorizationHeader
 
 LOG = logging.getLogger(__name__)
 
@@ -63,6 +66,7 @@ replication_opts = [
                default='full-sync',
                help='Replication protocols that define how data is synchronized between primary and secondary hosts'),
     cfg.StrOpt('replication_internal_secret',
+               default='',
                help='Unique replication internal secret shared between replicated hosts and used in web requests'),
     cfg.IntOpt('replication_starting_port',
                default=7001,
@@ -98,6 +102,7 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
         # self.SUPPORTS_ACTIVE_ACTIVE = True
         super(ReplicatedVolumeDriver, self).__init__(*args, **kwargs)
         self.configuration.append_config_values(replication_opts)
+        self.signature = EV3SignerForAuthorizationHeader(self.configuration.replication_internal_secret)
 
 
     def _init_vendor_properties(self):
@@ -140,6 +145,7 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
 
         self.listen()
 
+
     def create_volume(self, volume):
         super().create_volume(volume)
         return self.setup_replication(volume)
@@ -158,7 +164,6 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
         else:
             LOG.warning(f"Remote replica of volume {volume.id} didn't extended up to {new_size}G")
         self.__resize_drbd_resource(volume.id, new_size)
-
 
     def create_snapshot(self, snapshot):
         super().create_snapshot(snapshot)
@@ -180,7 +185,6 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
                 LOG.error(f"The snapshot {snapshot['name']}  of {snapshot['volume_name']} "
                           f"on backend {secondary_backend_id } was not created, "
                           f"an ReplicatedVolumeBackendRetryableException occurred: {a.message}")
-
 
     def delete_snapshot(self, snapshot):
         super().delete_snapshot(snapshot)
@@ -475,6 +479,7 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
         DRDB resource management
     """
     # TODO check refactoring
+    #@lockutils.synchronized('allocate_drdb_minors', external=True)
     @coordination.synchronized('allocate_drdb_minors')
     def __allocate_drdb_minors(self):
         """
@@ -547,15 +552,15 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
         :return: None
         """
         res_id = resource.get('volume_id')
-        protocol = ev3_res.REPLICATION_PROTOCOLS[resource.get('replication_mode')]
+        protocol = REPLICATION_PROTOCOLS[resource.get('replication_mode')]
         minor = resource.get('device_minor')
         port = resource.get('replication_port')
 
         backends = ''
         for b in resource.get('backends'):
-            backends += ev3_res.BACKEND.format(address=b.get('ip'), port=port, disk=b.get('volume'))
+            backends += BACKEND.format(address=b.get('ip'), port=port, disk=b.get('volume'))
 
-        config = ev3_res.RESOURCE_CONF.format(resource_id=res_id, protocol=protocol, backends=backends, minor=minor).lstrip()
+        config = RESOURCE_CONF.format(resource_id=res_id, protocol=protocol, backends=backends, minor=minor).lstrip()
 
         try:
             self.__write_drbd_config(res_id, config)
@@ -598,7 +603,6 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             raise e
-
 
     def __remove_drbd_config(self, resource):
         """
@@ -761,10 +765,8 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
         if data is None:
             data = {}
 
-        now_utc = datetime.datetime.now().isoformat() + 'Z'
-        secret_key = f"EV3{self.configuration.replication_internal_secret}".encode('utf-8')
-        hmac_digest = hmac.new(secret_key, now_utc.encode('utf-8'), hashlib.sha256)
-        headers = {ev3_res.HTTP_HEADER_X_EV3_TOKEN: hmac_digest.hexdigest(), ev3_res.HTTP_HEADER_X_EV3_DATE: now_utc }
+        headers = {}
+        self.signature.compute(access_key='',headers=headers, method='POST', path=api_method, parameters={}, body_content=json.dumps(data))
 
         try:
             with requests.post(url=f"{endpoint}{api_method}", headers=headers, json=data) as resp:
@@ -776,7 +778,7 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
             raise ReplicatedVolumeBackendRetryableException(data=str(a))
 
     """
-        OVT ev3 Backend Server / OVT ev3 Restful API 
+        OVT ev3 Backend Server / OVT ev3 Restful API
     """
     def __call__(self, environ, start_response):
         """
@@ -785,20 +787,15 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
         req = Request(environ)
         resp = Response()
 
-        # begin block: token check
-        ev3_date = req.headers.get(ev3_res.HTTP_HEADER_X_EV3_DATE)
-        token = req.headers.get(ev3_res.HTTP_HEADER_X_EV3_TOKEN)
+        # begin block: signature verification
 
-        if ev3_date is None or token is None:
-            resp.status_code = 403
-            return resp(environ, start_response)
+        signature_status = self.signature.verify_by_request(req)
 
-        secret_key = f"EV3{self.configuration.replication_internal_secret}".encode('utf-8')
-        hmac_digest = hmac.new(secret_key, ev3_date.encode('utf-8'), hashlib.sha256)
-        if token != hmac_digest.hexdigest():
-            resp.status_code = 403
+        LOG.info(f"Signature verification status: {signature_status}")
+        if signature_status != 200:
+            resp.status_code = signature_status
             return resp(environ, start_response)
-        # end block: token check
+        # end block: signature verification
 
         try:
             if req.method == 'GET' and req.path == '/heartbeat':
@@ -881,3 +878,10 @@ class ReplicatedVolumeDriver(LVMVolumeDriver):
         thread = Thread(target=serve_forever, args=(LOG,))
         thread.daemon = True
         thread.start()
+
+class EV3SignerForAuthorizationHeader(AbstractSignerForAuthorizationHeader):
+    def __init__(self, secret_key):
+        super().__init__(scheme='AWS4', region_name='MSK', service_name='ev3_storage', terminator='ev3_request')
+        self.secret_key = secret_key
+    def get_secret_key(self, access_key:str):
+        return self.secret_key
